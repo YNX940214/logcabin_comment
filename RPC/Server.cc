@@ -44,7 +44,7 @@ Server::RPCHandler::handleRPC(OpaqueServerRPC opaqueRPC)
     }
     std::shared_ptr<Service> service;
     {
-        std::lock_guard<std::mutex> lockGuard(server.mutex);
+        std::lock_guard<std::mutex> lockGuard(server.mutex);   //logcabin的rpc有not_ready的status，不像我的client rpc发出去了，就只能异步等server发回来ok，或者serve当即内存数据丢失
         auto it = server.services.find(rpc.getService());
         if (it != server.services.end())
             service = it->second;

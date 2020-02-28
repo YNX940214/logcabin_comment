@@ -562,7 +562,7 @@ void setGCFlag(Server& server)
 } // anonymous namespace
 
 void
-Configuration::reset()
+Configuration::reset()  //只在restoreInvariants中调用
 {
     NOTICE("Resetting to blank configuration");
     state = State::BLANK;
@@ -576,8 +576,10 @@ Configuration::reset()
     knownServers[localServer->serverId] = localServer;
 }
 
+
+//需要调用两次才能停止旧的configuration，设想abc->aef，第一次调用，oldserver为abc，newserver为aef，会开5个线程，没有人会exit，但是第二次调用的时候，oldserver为aef（其实这才是reconfiguration真正意义上的new servers），newserver为空，那么那些存在于knownservers中的reconfiguration真正的oldserver，将会调用exit
 void
-Configuration::setConfiguration(
+Configuration::setConfiguration( 
         uint64_t newId,
         const Protocol::Raft::Configuration& newDescription)
 {
@@ -589,7 +591,7 @@ Configuration::setConfiguration(
     else
         state = State::TRANSITIONAL;
     id = newId;
-    description = newDescription;
+    description = newDescription;  //description只有在这里才会被付值(排除reset)
     oldServers.servers.clear();
     newServers.servers.clear();
 
@@ -1190,7 +1192,7 @@ RaftConsensus::getLeaderHint() const
 }
 
 RaftConsensus::Entry
-RaftConsensus::getNextEntry(uint64_t lastIndex) const
+RaftConsensus::getNextEntry(uint64_t lastIndex) const  //这个函数由statemachine 调用
 {
     std::unique_lock<Mutex> lockGuard(mutex);
     uint64_t nextIndex = lastIndex + 1;
@@ -1305,7 +1307,7 @@ RaftConsensus::handleAppendEntries(
     // function early, we will set it again after the disk write.
     stepDown(request.term());
     setElectionTimer();
-    withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;
+    withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;  //功能增强了
 
     // Record the leader ID as a hint for clients.
     if (leaderId == 0) {
@@ -1385,7 +1387,7 @@ RaftConsensus::handleAppendEntries(
         }
 
         // Append this and all following entries.
-        std::vector<const Protocol::Raft::Entry*> entries;
+        std::vector<const Protocol::Raft::Entry*> entries;  //防止所有数据崩掉，如果检测到由UNKNOWN的entry，不会真正append
         do {
             const Protocol::Raft::Entry& entry = *it;
             if (entry.type() == Protocol::Raft::EntryType::UNKNOWN) {
@@ -1404,7 +1406,7 @@ RaftConsensus::handleAppendEntries(
         } while (it != request.entries().end());
         append(entries);
         clusterClock.newEpoch(entries.back()->cluster_time());
-        break;
+        break; //一次把后面所有的log给append了，直接break
     }
     response.set_last_log_index(log->getLastLogIndex());
 
@@ -1454,7 +1456,7 @@ RaftConsensus::handleInstallSnapshot(
     // and convert to follower if necessary; reset the election timer.
     stepDown(request.term());
     setElectionTimer();
-    withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;
+    withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;  //raft原文中并没有这种机制，作者代码对raft功能加强
 
     // Record the leader ID as a hint for clients.
     if (leaderId == 0) {
@@ -1499,7 +1501,7 @@ RaftConsensus::handleInstallSnapshot(
         }
         return;
     }
-    snapshotWriter->writeRaw(request.data().data(), request.data().length());
+    snapshotWriter->writeRaw(request.data().data(), request.data().length()); //request.offset和上一次snapshot write的offset对上了
     response.set_bytes_stored(snapshotWriter->getBytesWritten());
 
     if (request.done()) {
@@ -1582,7 +1584,7 @@ RaftConsensus::handleRequestVote(
 }
 
 std::pair<RaftConsensus::ClientResult, uint64_t>
-RaftConsensus::replicate(const Core::Buffer& operation)
+RaftConsensus::replicate(const Core::Buffer& operation) // only ClientService::StateMachineCommand calls, 添加这个函数是因为replicateEntry复用
 {
     std::unique_lock<Mutex> lockGuard(mutex);
     Log::Entry entry;
@@ -1636,7 +1638,7 @@ RaftConsensus::setConfiguration(
         s->set_server_id(it->server_id());
         s->set_addresses(it->addresses());
     }
-    configuration->setStagingServers(nextConfiguration);
+    configuration->setStagingServers(nextConfiguration); //nextConfiguration中的所有server各自开一个peer线程
     stateChanged.notify_all();
 
     // Wait for new servers to be caught up. This will abort if not every
@@ -1644,21 +1646,21 @@ RaftConsensus::setConfiguration(
     uint64_t term = currentTerm;
     ++currentEpoch;
     uint64_t epoch = currentEpoch;
-    TimePoint checkProgressAt = Clock::now() + ELECTION_TIMEOUT;
+    TimePoint checkProgressAt = Clock::now() + ELECTION_TIMEOUT; //如果规定时间内不能完成reconfigure，abort，回滚到上一个configuration的snapshot
     while (true) {
         if (exiting || term != currentTerm) {
             NOTICE("Lost leadership, aborting configuration change");
             // caller will fill in response
             return ClientResult::NOT_LEADER;
         }
-        if (configuration->stagingAll(&Server::isCaughtUp)) {
+        if (configuration->stagingAll(&Server::isCaughtUp)) {  //这里isCaughtUp和epoch有什么区别？为什么有了epoch还要isCaughtUp?这需要逆向找isCaughtUp，仔细一看就会发现isCaughtUp这个值只有被set成true，没有被set成false，且它被set成true的逻辑太奇怪了，看不懂
             NOTICE("Done catching up servers");
             break;
         }
         if (Clock::now() >= checkProgressAt) {
             using RaftConsensusInternal::StagingProgressing;
             StagingProgressing progressing(epoch, response);
-            if (!configuration->stagingAll(progressing)) {
+            if (!configuration->stagingAll(progressing)) {    //如果此时不是所有的server的 epoch都>= currentEpoch，那么reconfiguration失败了，返回resp给client
                 NOTICE("Failed to catch up new servers, aborting "
                        "configuration change");
                 configuration->resetStagingServers();
@@ -1938,7 +1940,7 @@ operator<<(std::ostream& os, const RaftConsensus& raft)
 //// RaftConsensus private methods that MUST acquire the lock
 
 void
-RaftConsensus::stateMachineUpdaterThreadMain()
+RaftConsensus::stateMachineUpdaterThreadMain()  //似乎是一个loop，会不停检查所有server的statemachine version是否满足，如果不满足，也只是append一条entry而已，不知道这样是如何阻止不满足version的entry apply的？
 {
     // This implementation might create many spurious entries, since this
     // process will append a state machine version if it hasn't appended that
@@ -2066,7 +2068,7 @@ RaftConsensus::timerThreadMain()
 }
 
 void
-RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer)
+RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer) //done
 {
     std::unique_lock<Mutex> lockGuard(mutex);
     Core::ThreadId::setName(
@@ -2120,7 +2122,7 @@ RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer)
 }
 
 void
-RaftConsensus::stepDownThreadMain()
+RaftConsensus::stepDownThreadMain()  //raft论文中好像是没有这个机制的，我的实现是主会一直等在那里，直到有更高term的主将其降级
 {
     std::unique_lock<Mutex> lockGuard(mutex);
     Core::ThreadId::setName("stepDown");
@@ -2135,8 +2137,8 @@ RaftConsensus::stepDownThreadMain()
                 // in the configuration), we need to sleep. Without this guard,
                 // this method would not relinquish the CPU.
                 ++currentEpoch;
-                if (configuration->quorumMin(&Server::getLastAckEpoch) <
-                    currentEpoch) {
+                //这些peer的getLastAckEpoch是在别的线程更新的
+                if (configuration->quorumMin(&Server::getLastAckEpoch) < currentEpoch) {  //反之如果quorumMin(lastackepoch) >= currentEpoch说明主和quorum的node能保持正常的rpc通信，所以阻塞（不需要stepDown）
                     break;
                 }
             }
@@ -2152,7 +2154,7 @@ RaftConsensus::stepDownThreadMain()
         while (true) {
             if (exiting)
                 return;
-            if (currentTerm > term)
+            if (currentTerm > term) //currentTerm在别的线程被更新
                 break;
             if (configuration->quorumMin(&Server::getLastAckEpoch) >= epoch)
                 break;
@@ -2200,7 +2202,7 @@ RaftConsensus::advanceCommitIndex()
     if (state == State::LEADER && commitIndex >= configuration->id) {
         // Upon committing a configuration that excludes itself, the leader
         // steps down.
-        if (!configuration->hasVote(configuration->localServer)) {
+        if (!configuration->hasVote(configuration->localServer)) { //reconfigure abc -> aef ，b是主，根据这个逻辑，b会退位
             NOTICE("Newly committed configuration does not include self. "
                    "Stepping down as leader");
             stepDown(currentTerm + 1);
@@ -2209,7 +2211,8 @@ RaftConsensus::advanceCommitIndex()
 
         // Upon committing a reconfiguration (Cold,new) entry, the leader
         // creates the next configuration (Cnew) entry.
-        if (configuration->state == Configuration::State::TRANSITIONAL) {
+//参考configuration::setConfiguration（两阶段），生成的这条entry这会让集群从transitional进入new的configuration（这条entry的prev_为reconfigure修改之后的servers，next为空）, 而如果我们不是处于transitional状态，那就相当于什么都没有发生，但是如果是transitional状态（考虑commitIndex==configuration.id），主也会立刻发起下一条configuration的entry
+        if (configuration->state == Configuration::State::TRANSITIONAL) {  
             Log::Entry entry;
             entry.set_term(currentTerm);
             entry.set_type(Protocol::Raft::EntryType::CONFIGURATION);
@@ -2282,7 +2285,7 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
     uint64_t numEntries = 0;
     if (!peer.suppressBulkData)
         numEntries = packEntries(peer.nextIndex, request);
-    request.set_commit_index(std::min(commitIndex, prevLogIndex + numEntries));
+    request.set_commit_index(std::min(commitIndex, prevLogIndex + numEntries)); //与我的实现逻辑不同
 
     // Execute RPC
     Protocol::Raft::AppendEntries::Response response;
@@ -2306,14 +2309,14 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
 
     // Process response
 
-    if (currentTerm != request.term() || peer.exiting) {
+    if (currentTerm != request.term() || peer.exiting) {  //我的实现里面逻辑也有 ，如果回来的时候term已经不是之前的term了（比如这个主在发出了rpc之后，变成了从，又变成了主，收到resp之后比较term不同，会丢弃resp不处理)
         // we don't care about result of RPC
         return;
     }
     // Since we were leader in this term before, we must still be leader in
     // this term.
     assert(state == State::LEADER);
-    if (response.term() > currentTerm) {
+    if (response.term() > currentTerm) { //这里rpc比我的实现能携带更多的信息
         NOTICE("Received AppendEntries response from server %lu in term %lu "
                "(this server's term was %lu)",
                 peer.serverId, response.term(), currentTerm);
@@ -2337,16 +2340,11 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
             peer.nextIndex = peer.matchIndex + 1;
             peer.suppressBulkData = false;
 
-            if (!peer.isCaughtUp_ &&
-                peer.thisCatchUpIterationGoalId <= peer.matchIndex) {
-                Clock::duration duration =
-                    Clock::now() - peer.thisCatchUpIterationStart;
-                uint64_t thisCatchUpIterationMs =
-                    uint64_t(std::chrono::duration_cast<
-                                 std::chrono::milliseconds>(duration).count());
-                if (labs(int64_t(peer.lastCatchUpIterationMs -
-                                 thisCatchUpIterationMs)) * 1000L * 1000L <
-                    std::chrono::nanoseconds(ELECTION_TIMEOUT).count()) {
+            //这段被用来设置isCaughtUp
+            if (!peer.isCaughtUp_ && peer.thisCatchUpIterationGoalId <= peer.matchIndex) {
+                Clock::duration duration = Clock::now() - peer.thisCatchUpIterationStart;
+                uint64_t thisCatchUpIterationMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
+                if (labs(int64_t(peer.lastCatchUpIterationMs - thisCatchUpIterationMs)) * 1000L * 1000L < std::chrono::nanoseconds(ELECTION_TIMEOUT).count()) { //看不懂
                     peer.isCaughtUp_ = true;
                     stateChanged.notify_all();
                 } else {
@@ -2355,7 +2353,9 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
                     peer.thisCatchUpIterationGoalId = log->getLastLogIndex();
                 }
             }
+            //回想peerThreadMain里面，此时如果已经从已经追上了主，nextHeartbeatTime被设置，且matchIndex条件，不会立即发送下一个rpc，反之，如果没追上，matchIndex条件会导致立刻发送下一次rpc
         } else {
+            //对面核对prelog_index和term失败，回退nextIndex
             if (peer.nextIndex > 1)
                 --peer.nextIndex;
             // A server that hasn't been around for a while might have a much
@@ -2788,14 +2788,14 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
                   "RPC or claims the request is malformed");
     }
 
-    if (currentTerm != request.term() || state != State::CANDIDATE ||
+    if (currentTerm != request.term() || state != State::CANDIDATE || //这个rpc已经过时了，比如新一轮requestvote开始 || 此term投票结果已经出来，另一个节点在此term当选了主，并通过AE将此节点变成从
         peer.exiting) {
         VERBOSE("ignore RPC result");
         // we don't care about result of RPC
         return;
     }
 
-    if (response.term() > currentTerm) {
+    if (response.term() > currentTerm) { //peer的term比我们高，应该stepdown
         NOTICE("Received RequestVote response from server %lu in "
                "term %lu (this server's term was %lu)",
                 peer.serverId, response.term(), currentTerm);
@@ -2819,7 +2819,7 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
 }
 
 void
-RaftConsensus::setElectionTimer()
+RaftConsensus::setElectionTimer() // l0
 {
     std::chrono::nanoseconds duration(
         Core::Random::randomRange(
@@ -2857,7 +2857,7 @@ RaftConsensus::printElectionState() const
 void
 RaftConsensus::startNewElection()
 {
-    if (configuration->id == 0) {
+    if (configuration->id == 0) { //至少是1，bootstrap的是1，这导致还没有加入到cluster中的节点不会 startElection
         // Don't have a configuration: go back to sleep.
         setElectionTimer();
         return;
@@ -2962,7 +2962,7 @@ RaftConsensus::updateLogMetadata()
 }
 
 bool
-RaftConsensus::upToDateLeader(std::unique_lock<Mutex>& lockGuard) const
+RaftConsensus::upToDateLeader(std::unique_lock<Mutex>& lockGuard) const  //对应raft论文中中的图8？
 {
     ++currentEpoch;
     uint64_t epoch = currentEpoch;
@@ -2995,7 +2995,7 @@ RaftConsensus::upToDateLeader(std::unique_lock<Mutex>& lockGuard) const
 }
 
 std::ostream&
-operator<<(std::ostream& os, RaftConsensus::ClientResult clientResult)
+operator<<(std::ostream& os, RaftConsensus::ClientResult clientResult) //l0
 {
     typedef RaftConsensus::ClientResult ClientResult;
     switch (clientResult) {
@@ -3016,7 +3016,7 @@ operator<<(std::ostream& os, RaftConsensus::ClientResult clientResult)
 }
 
 std::ostream&
-operator<<(std::ostream& os, RaftConsensus::State state)
+operator<<(std::ostream& os, RaftConsensus::State state) //l0
 {
     typedef RaftConsensus::State State;
     switch (state) {
